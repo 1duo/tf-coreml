@@ -2,6 +2,7 @@ from __future__ import print_function
 from six import string_types as _string_types
 
 import numpy as np
+from os import path as _os_path
 import tensorflow as tf
 import coremltools
 from tensorflow.python.util import compat
@@ -13,6 +14,18 @@ from . import _ops_to_layers
 from ._interpret_shapes import _interpret_shape as interpret_shape
 from ._tf_graph_transform import _topological_sort_ops, _find_unused_ops
 from .optimizations._optimize_nn_spec import optimize_nn_spec
+
+if True:  # Has TensorFlow 2
+  from tensorflow.python.framework import dtypes as _dtypes
+  from tensorflow.python.keras.saving import saving_utils as _saving_utils
+  from tensorflow.python.framework.convert_to_constants import (
+    convert_variables_to_constants_v2 as _convert_variables_to_constants_v2,
+  )
+  from tensorflow.lite.python.util import (
+    run_graph_optimizations as _run_graph_optimizations,
+  )
+  from tensorflow.lite.python.util import get_grappler_config as _get_grappler_config
+
 
 class SupportedVersion():
     # Supported iOS Version
@@ -188,7 +201,7 @@ def _check_unsupported_ops(ops, output_feature_names, skip_ops):
       raise NotImplementedError("Unsupported Ops of type: %s" % (
         ','.join(unsupported_op_types)))
 
-def _convert_pb_to_mlmodel(tf_model_path,
+def _convert_pb_to_mlmodel(graph_def,
                            mlmodel_path,
                            output_feature_names,
                            input_name_shape_dict={},
@@ -207,18 +220,10 @@ def _convert_pb_to_mlmodel(tf_model_path,
                            ):
 
   # Load the TF graph
-  print('')
-  print('Loading the TF graph...')
-  with open(tf_model_path, 'rb') as f:
-    serialized = f.read()
+  with tf.compat.v1.Graph().as_default() as g:
+    tf.import_graph_def(graph_def, name='')
 
-  gdef = tf.GraphDef()
-  gdef.ParseFromString(serialized)
-
-  with tf.Graph().as_default() as g:
-    tf.import_graph_def(gdef, name='')
-
-  sess = tf.Session(graph=g)
+  sess = tf.compat.v1.Session(graph=g)
   OPS = g.get_operations()
 
   if 'DecodeJpeg' in [op.type for op in OPS]:
@@ -541,6 +546,102 @@ def _convert_pb_to_mlmodel(tf_model_path,
   return mlmodel
 
 
+def _concrete_fn_from_tf_keras_or_h5(keras_model):
+  if isinstance(keras_model, tf.keras.Model):
+    input_signature = _saving_utils.model_input_signature(
+      keras_model, keep_original_batch_size=True
+    )
+    fn = _saving_utils.trace_model_call(keras_model, input_signature)
+  else:
+    keras_model = tf.keras.models.load_model(keras_model)
+    input_signature = _saving_utils.model_input_signature(
+      keras_model, keep_original_batch_size=True
+    )
+    fn = _saving_utils.trace_model_call(keras_model, input_signature)
+  return [fn.get_concrete_function()]
+
+
+def _graph_def_from_concrete_fn(cfs):
+  if len(cfs) != 1:
+    raise NotImplementedError("Only a single concrete function is supported.")
+
+  frozen_fn = _convert_variables_to_constants_v2(cfs[0], lower_control_flow=False)
+  graph_def = frozen_fn.graph.as_graph_def(add_shapes=True)
+
+  # run a Grappler's constant folding pass.
+  fn_inputs = [t for t in frozen_fn.inputs if t.dtype != _dtypes.resource]
+  graph_def = _run_graph_optimizations(
+    graph_def,
+    fn_inputs,
+    frozen_fn.outputs,
+    config=_get_grappler_config(["constfold", "dependency"]),
+    graph=frozen_fn.graph,
+  )
+  return graph_def
+
+
+def _graph_def_from_model(tf_model, outputs=None):
+  """Get GraphDef from given model."""
+  msg = (
+    "Expected model format: [.pb | tf.Graph | SavedModel | [concrete_function] | "
+    "tf.keras.Model | .h5], got {}"
+  )
+  print('')
+  print('Loading the TF graph...')
+
+  if isinstance(tf_model, tf.Graph) and hasattr(tf_model, "as_graph_def"):
+    graph_def = tf_model.as_graph_def(add_shapes=True)
+    return _extract_sub_graph(graph_def, outputs)
+
+  if (
+          isinstance(tf_model, list)
+          or isinstance(tf_model, tf.keras.Model)
+          or isinstance(tf_model, _string_types)
+  ):
+    cfs = []
+    if isinstance(tf_model, list):
+      cfs = tf_model
+    if isinstance(tf_model, tf.keras.Model):
+      cfs = _concrete_fn_from_tf_keras_or_h5(tf_model)
+    elif isinstance(tf_model, _string_types):
+      if not _os_path.exists(tf_model):
+        raise ValueError(
+          'Input model "{}" does not exist'.format(tf_model)
+        )
+      elif _os_path.isfile(tf_model) and tf_model.endswith(".pb"):
+        with open(tf_model, 'rb') as f:
+          serialized = f.read()
+
+        gdef = tf.compat.v1.GraphDef()
+        gdef.ParseFromString(serialized)
+
+        with tf.compat.v1.Graph().as_default() as graph_def:
+          tf.import_graph_def(gdef, name='')
+        return _extract_sub_graph(graph_def, outputs)
+      elif _os_path.isfile(tf_model) and tf_model.endswith(".h5"):
+        cfs = _concrete_fn_from_tf_keras_or_h5(tf_model)
+      elif _os_path.isdir(tf_model):
+        saved_model = tf.saved_model.load(tf_model)
+        sv = saved_model.signatures.values()
+        cfs = sv if isinstance(sv, list) else list(sv)
+      else:
+        raise NotImplementedError(msg.format(tf_model))
+
+    graph_def = _graph_def_from_concrete_fn(cfs)
+    return _extract_sub_graph(graph_def, outputs)
+  else:
+    raise NotImplementedError(msg.format(tf_model))
+
+
+def _extract_sub_graph(graph_def, outputs=None):
+    """Extract sub-graph based on user-provided outputs."""
+    if outputs is None or len(outputs) == 0:
+        return graph_def
+    outputs = outputs if isinstance(outputs, list) else [outputs]
+    outputs = [i.split(":")[0] for i in outputs]
+    return tf.compat.v1.graph_util.extract_sub_graph(graph_def, outputs)
+
+
 def convert(tf_model_path,
             mlmodel_path=None,
             output_feature_names=None,
@@ -724,8 +825,10 @@ def convert(tf_model_path,
   if tf_image_format is not None:
     warn('tf_image_format not honored when minimum_ios_deployment_target < 13')
 
+  graph_def = _graph_def_from_model(tf_model_path)
+
   return _convert_pb_to_mlmodel(
-      tf_model_path,
+      graph_def,
       mlmodel_path,
       output_feature_names,
       input_name_shape_dict,
